@@ -1,4 +1,6 @@
 from flask import Flask, request, abort, make_response
+from marshmallow import Schema, fields, validate, ValidationError
+from marshmallow.validate import Range
 from flask_restful import Resource, Api
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func
@@ -33,6 +35,39 @@ class HomePage(Resource):
         return {'message': 'Welcome to the homepage'}
 
 
+class MedicineDataSchema(Schema):
+    medicine_name = fields.Str(required=True)
+    quantity = fields.Float(required=True)
+    price = fields.Float(required=True)
+    expiry_date = fields.Date(required=True, format="%Y%m%d")
+    batch_number = fields.Str(required=True)
+    supplier_code = fields.Str(required=True)
+
+
+class PurchaseInputSchema(Schema):
+    medicines = fields.List(fields.Nested(MedicineDataSchema), required=True)
+
+
+class BarcodeInputSchema(Schema):
+    token = fields.Str(required=True)
+    barcode = fields.Str(required=True)
+
+
+class PurchaseOutputItemSchema(Schema):
+    index = fields.Int(required=True)
+    status = fields.Int(required=True)
+    message = fields.Str(required=True)
+    token = fields.Str()
+
+
+class PurchaseOutputSchema(Schema):
+    response = fields.List(fields.Nested(PurchaseOutputItemSchema), required=True)
+
+
+class BarcodeOutputSchema(Schema):
+    message = fields.Str(required=True)
+
+
 def generate_token_and_store_data(medicine_id, quantity, price, expiry_date, batch_number, supplier_code):
     token = shortuuid.uuid()
     token_to_medicine_id[token] = {
@@ -62,12 +97,17 @@ class PurchaseResource(Resource):
             db.session.add(inventory)
 
     def post(self):
-        data = request.get_json()
-        medicines = data.get('medicines')
-        response = []
-        has_errors = False
+        schema = PurchaseInputSchema()
+        try:
+            data = schema.load(request.json)
+        except ValidationError as e:
+            return e.messages, 400
 
-        for medicine_data in medicines:
+        medicines = data['medicines']
+
+        response = [None] * len(medicines)  # Initialize the response list
+
+        for index, medicine_data in enumerate(medicines):  # Use enumerate to get the index
             medicine_name = medicine_data.get('medicine_name')
 
             medicine = MedicineDetail.query.filter(
@@ -78,7 +118,7 @@ class PurchaseResource(Resource):
             ).first()
 
             if not medicine:
-                new_medicine = MedicineDetail(medicine_name=medicine_name)
+                new_medicine = MedicineDetail(medicine_name_bg=medicine_name)  # Use medicine_name_bg
                 db.session.add(new_medicine)
                 db.session.commit()
                 medicine = new_medicine
@@ -89,11 +129,12 @@ class PurchaseResource(Resource):
                 details = {key: medicine_data.get(key) for key in
                            ["quantity", "price", "expiry_date", "batch_number", "supplier_code"]}
                 token = generate_token_and_store_data(medicine.medicine_id, **details)
-                response.append({
+                response[index] = {
+                    "index": index,
                     "status": 400,
                     "message": f"Missing barcode for {medicine_name}. Please provide a barcode for it.",
                     "token": token
-                })
+                }
 
             else:
                 details = {key: medicine_data.get(key) for key in
@@ -104,19 +145,28 @@ class PurchaseResource(Resource):
                 self.create_or_update_inventory(medicine.medicine_id, details['price'], details['quantity'],
                                                 details['expiry_date'])
 
-                response.append({
+                response[index] = {
+                    "index": index,
                     "status": 201,
-                    "message": f"Purchase and inventory records created successfully for {medicine_name}."})
+                    "message": f"Purchase and inventory records created successfully for {medicine_name}."
+                }
 
         db.session.commit()
-        return response
+        output_schema = PurchaseOutputSchema()
+        output_data = output_schema.dump({"response": response})
+        return output_data, 200
 
 
 class BarcodeResource(Resource):
     def post(self):
-        data = request.get_json()
-        token = data.get('token')
-        barcode = data.get('barcode')
+        schema = BarcodeInputSchema()
+        try:
+            data = schema.load(request.json)
+        except ValidationError as e:
+            return e.messages, 400
+
+        token = data['token']
+        barcode = data['barcode']
 
         if not token or not barcode:
             return {"message": "Both token and barcode must be provided."}, 400
@@ -156,22 +206,58 @@ class BarcodeResource(Resource):
 
             db.session.add(purchase)
         db.session.commit()
-        return {"message": "Barcode added successfully"}, 201
+        output_schema = BarcodeOutputSchema()
+        output_data = output_schema.dump({"message": "Barcode added successfully"})
+        return output_data, 201
 
 
-def create_or_get_sale_order(sale_order_id):
-    if sale_order_id:
-        sale_order = SaleOrder.query.get(sale_order_id)
-        if not sale_order:
-            sale_order = SaleOrder(id=sale_order_id)
-            db.session.add(sale_order)
-            db.session.commit()
-    else:
+class SalePostInputSchema(Schema):
+    barcode = fields.Str(required=True)
+    quantity = fields.Float(validate=validate.Range(min=0), default=1)
+
+
+class SaleOutputSchema(Schema):
+    medicine_name = fields.Str(required=True)
+    quantity = fields.Float(required=True)
+    price = fields.Float(required=True, allow_none=True)
+    opiate = fields.Bool(required=True)
+
+
+class SalePutInputSchema(Schema):
+    quantity = fields.Float(validate=Range(min=0), allow_none=True)
+    price = fields.Float(validate=Range(min=0), allow_none=True)
+    sale_order_id = fields.Int(validate=Range(min=1), allow_none=True)
+
+
+class SaleOrderResource(Resource):
+    def post(self):
         sale_order = SaleOrder()
         db.session.add(sale_order)
         db.session.commit()
-        sale_order_id = sale_order.id
-    return sale_order_id
+        return {"sale_order_id": sale_order.id}, 201
+
+    def get(self, sale_order_id):
+        sale_order = SaleOrder.query.get(sale_order_id)
+
+        if not sale_order:
+            abort(404)
+
+        sales = Sale.query.filter_by(sale_order_id=sale_order_id).all()
+
+        sale_list = []
+
+        for sale in sales:
+            medicine = MedicineDetail.query.get(sale.medicine_id)
+            sale_data = {
+                'medicine_name': medicine.medicine_name_bg or medicine.medicine_name,
+                'quantity': sale.quantity,
+                'price': sale.price
+            }
+            if medicine.opiate:
+                sale_data['opiate'] = True
+            sale_list.append(sale_data)
+
+        return {"sale_order_id": sale_order.id, "sales": sale_list}, 200
 
 
 def get_medicine_id(barcode):
@@ -187,12 +273,20 @@ def get_medicine_id(barcode):
 
 
 class SaleResource(Resource):
-    def post(self):
-        barcode = request.json.get('barcode')
-        quantity = float(request.json.get('quantity', 1))
-        sale_order_id = request.json.get('sale_order_id')
+    def post(self, sale_order_id):
 
-        sale_order_id = create_or_get_sale_order(sale_order_id)
+        if not SaleOrder.query.get(sale_order_id):
+            return {"error": "Sale Order not found"}, 404
+
+        input_schema = SalePostInputSchema()
+        try:
+            data = input_schema.load(request.json)
+        except ValidationError as e:
+            return e.messages, 400
+
+        barcode = data['barcode']
+        quantity = data.get('quantity', 1)
+
         medicine_id = get_medicine_id(barcode)
 
         inventory = Inventory.query.filter_by(medicine_id=medicine_id).first()
@@ -227,37 +321,60 @@ class SaleResource(Resource):
         if medicine.opiate:
             result['opiate'] = True
 
-        return result, 201
+        output_schema = SaleOutputSchema()
+        output_data = output_schema.dump(result)
+        return output_data, 201
 
-    def put(self, sale_id):
+    def put(self, sale_order_id, sale_id):
         sale = Sale.query.get(sale_id)
 
-        if not sale:
+        if not sale or sale.sale_order_id != sale_order_id:
             abort(404)
 
-        quantity = request.json.get('quantity')
-        price = request.json.get('price')
-        sale_order_id = request.json.get('sale_order_id')
+        schema = SalePutInputSchema()
+        try:
+            data = schema.load(request.json)
+        except ValidationError as e:
+            return e.messages, 400
+
+        quantity = data.get('quantity')
+        price = data.get('price')
 
         if quantity is not None:
+            original_quantity = sale.quantity
+            difference = quantity - original_quantity
+
+            inventory = Inventory.query.filter_by(medicine_id=sale.medicine_id).first()
+            if inventory:
+                new_inventory_quantity = inventory.quantity - difference
+                if new_inventory_quantity >= 0:
+                    inventory.quantity = new_inventory_quantity
+                    db.session.add(inventory)
+                else:
+                    return {"error": "Not enough inventory available."}, 400
+
             sale.quantity = quantity
 
         if price is not None:
             sale.price = price
-
-        if sale_order_id is not None:
-            sale.sale_order_id = sale_order_id
 
         db.session.add(sale)
         db.session.commit()
 
         return make_response("", 204)
 
-    def delete(self, sale_id):
+    def delete(self, sale_order_id, sale_id):
         sale = Sale.query.get(sale_id)
 
-        if not sale:
+        if not sale or sale.sale_order_id != sale_order_id:
             abort(404)
+
+        inventory = Inventory.query.filter_by(medicine_id=sale.medicine_id).first()
+        if inventory:
+            inventory.quantity += sale.quantity
+            if inventory.quantity < 0:
+                inventory.quantity = 0
+            db.session.add(inventory)
 
         db.session.delete(sale)
         db.session.commit()
@@ -265,7 +382,8 @@ class SaleResource(Resource):
         return make_response("", 204)
 
 
-api.add_resource(SaleResource, '/sale', '/sale/<int:sale_id>')
+api.add_resource(SaleOrderResource, '/sale_order', '/sale_order/<int:sale_order_id>')
+api.add_resource(SaleResource, '/sale_order/<int:sale_order_id>/sale', '/sale_order/<int:sale_order_id>/sale/<int:sale_id>')
 api.add_resource(PurchaseResource, '/purchase')
 api.add_resource(BarcodeResource, '/add_barcode')
 api.add_resource(LandingPage, '/')
